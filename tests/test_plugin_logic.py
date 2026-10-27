@@ -296,23 +296,21 @@ class CollectTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.stopped)
         self.assertFalse(hasattr(event, "_mt_topics"))
 
-    async def test_single_message_with_two_topics_is_immediate(self):
-        plugin = build_plugin(merge_window_seconds=5)
+    async def test_single_message_with_two_questions_takes_over(self):
+        plugin = build_plugin(merge_window_seconds=0.05)
         event = FakeEvent("今天天气怎么样？晚饭吃什么？")
-
-        started = time.monotonic()
         await plugin._collect_message(event)
-        elapsed = time.monotonic() - started
 
-        self.assertLess(elapsed, 1.0)
-        self.assertEqual(len(event._mt_topics), 2)
+        # 一条消息里多个问题：消息只有 1 条，但仍然接管（由模型拆话题）
+        self.assertTrue(hasattr(event, "_mt_topics"))
+        self.assertEqual(len(event._mt_topics), 1)
 
-    async def test_continuation_folded_into_previous_topic(self):
+    async def test_multiple_messages_are_kept_together(self):
         plugin = build_plugin(merge_window_seconds=0.1)
         _, e2 = await self._send_pair(plugin, "我今天去公园了", "然后呢")
 
-        self.assertEqual(len(e2._mt_topics), 1)
-        self.assertIn("然后呢", e2._mt_topics[0].text)
+        # 交给模型判断这两条是不是同一话题，插件不再自己折叠
+        self.assertEqual(len(e2._mt_topics), 2)
 
     async def test_command_not_collected(self):
         plugin = build_plugin(merge_window_seconds=0.03)

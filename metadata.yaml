@@ -3,7 +3,7 @@ display_name: 多话题分答
 desc: 连着发来多条消息或多个话题时，让 AI 引用原消息、分条逐一回复，像真人聊天一样接话。适配 NapCat / OneBot v11。
 short_desc: 多个话题逐个引用回复，像真人一样聊天
 help: 安装后自动生效，无需指令。可在插件配置中调整「连续消息合并等待时间」「引用回复」「分段间隔」等。
-version: 2.0.4
+version: 2.1.0
 author: ZhuanZ
 astrbot_version: ">=4.16,<5"
 support_platforms:

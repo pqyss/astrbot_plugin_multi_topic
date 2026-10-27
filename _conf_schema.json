@@ -5,23 +5,35 @@
     "default": true
   },
   "merge_window_seconds": {
-    "description": "连续消息合并等待时间（秒）",
+    "description": "合并等待时间（秒，防抖）",
     "type": "float",
-    "default": 2.5,
+    "default": 6.0,
     "slider": {
       "min": 0,
-      "max": 6,
+      "max": 12,
       "step": 0.1
     },
-    "hint": "收到消息后先等这么久，看是否还有后续消息。两条消息间隔小于该值时会被合并成一次「分话题回复」。设为 0 可关闭合并。"
+    "hint": "收到消息后开始计时，每收到一条新消息就重新计时；安静满这么久之后才把这一批消息一起交给模型。如果你打字间隔是 4~5 秒，建议设 6~8。设 0 关闭防抖（每条消息立即回复）。"
+  },
+  "wait_active_agent": {
+    "description": "上一条回复还在生成时，先排队等待",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，如果机器人正在生成上一条回复，新消息会等它结束再处理，避免被 AstrBot 的 follow-up 机制并进旧回复、只回答最后一句。"
+  },
+  "max_wait_seconds": {
+    "description": "排队等待的最长时间（秒）",
+    "type": "float",
+    "default": 60.0,
+    "hint": "超过这个时间仍未结束就不再等待，按正常流程处理。"
   },
   "debounce_max_chars": {
     "description": "超过这个长度的消息不等待",
     "type": "int",
-    "default": 80,
+    "default": 200,
     "slider": {
       "min": 10,
-      "max": 500,
+      "max": 1000,
       "step": 10
     },
     "hint": "很长的消息一般不会紧接着再发一条，跳过等待可以更快回复。"
@@ -33,12 +45,12 @@
     "hint": "超过这个时间还没被回答的消息会被丢弃，避免下次突然翻旧账。"
   },
   "max_topics": {
-    "description": "单轮最多处理几个话题",
+    "description": "单轮最多合并几条消息",
     "type": "int",
     "default": 6,
     "slider": {
       "min": 2,
-      "max": 10,
+      "max": 12,
       "step": 1
     }
   },
@@ -51,17 +63,6 @@
       "max": 20,
       "step": 1
     }
-  },
-  "continuation_max_chars": {
-    "description": "「接着上一个话题说」的最大长度",
-    "type": "int",
-    "default": 6,
-    "slider": {
-      "min": 0,
-      "max": 20,
-      "step": 1
-    },
-    "hint": "「嗯」「然后呢」这类短句会被当作延续上一个话题，而不是单独开一个话题。设为 0 关闭该判断。"
   },
   "send_quotes": {
     "description": "回复时引用原消息",

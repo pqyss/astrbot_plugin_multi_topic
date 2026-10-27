@@ -383,6 +383,38 @@ class MultiTopicPlugin(Star):
         segmented = bool(settings.get("streaming_segmented", False))
         return streaming and segmented
 
+    @staticmethod
+    def _active_agent_runners():
+        """拿到 AstrBot 当前的「正在生成的 Agent」表（拿不到就返回 None）。"""
+
+        try:
+            from astrbot.core.pipeline.process_stage import follow_up
+
+            return getattr(follow_up, "_ACTIVE_AGENT_RUNNERS", None)
+        except Exception:
+            return None
+
+    async def _wait_for_idle(self, umo: str) -> None:
+        """如果这个会话正有回复在生成，先等它结束。
+
+        AstrBot 的 follow-up 机制会把生成过程中收到的新消息并进当前这次生成，
+        模型往往只回应最新一句，前面的消息就丢了。等当前生成结束后再处理，
+        这些消息就会各自排队、按正常流程回答，而不是被吞掉。
+        """
+
+        if not bool(self._cfg("wait_active_agent", True)):
+            return
+        runners = self._active_agent_runners()
+        if runners is None:
+            return
+        deadline = time.monotonic() + float(self._cfg("max_wait_seconds", 60))
+        waited = False
+        while umo in runners and time.monotonic() < deadline:
+            if not waited:
+                self._log("检测到上一次回复还在生成，先排队等待，避免被 follow-up 吞掉")
+                waited = True
+            await asyncio.sleep(0.3)
+
     # ------------------------------------------------------------------
     # 第一步：收集 / 合并连续消息
     # ------------------------------------------------------------------
@@ -434,22 +466,23 @@ class MultiTopicPlugin(Star):
         state.seq += 1
         my_seq = state.seq
 
-        # 单条消息本身就包含多个话题 → 不再等待，立即处理
-        delay = self._float_cfg("merge_window_seconds", 2.5)
-        max_chars = self._int_cfg("debounce_max_chars", 80, 10, 2000)
-        multi_in_one = len(split_topics(text, 6, 2)) >= 2
-        # 已经攒到不止一条消息时，不需要再等满整个窗口：
-        # 此时要等的只是「会不会还有第三条」，缩短等待可以明显降低延迟。
-        if len(state.topics) > 1:
-            delay = min(delay, 0.8)
-        if delay > 0 and not multi_in_one and len(text) <= max_chars:
+        # 先确保上一次生成已经结束，否则这条消息会被 follow-up 并进旧的生成里
+        await self._wait_for_idle(umo)
+
+        # 防抖：每条新消息都会让「最新一条」重新计时，
+        # 直到安静满 merge_window_seconds 才把整批消息交给模型。
+        delay = self._float_cfg("merge_window_seconds", 6.0)
+        max_chars = self._int_cfg("debounce_max_chars", 200, 10, 4000)
+        if delay > 0 and len(text) <= max_chars:
             try:
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 raise
+            # 等待期间可能刚好有新的生成开始，再确认一次
+            await self._wait_for_idle(umo)
             if state.seq != my_seq:
-                # 后面还有消息，让它统一收口
-                self._log(f"又收到新消息，本条并入下一批: {text[:40]}")
+                # 后面还有消息，由更新的那条重新计时
+                self._log(f"收到新消息，重新计时: {text[:40]}")
                 event.stop_event()
                 return
 
@@ -459,33 +492,41 @@ class MultiTopicPlugin(Star):
         if not pending:
             return
 
-        topics = self._build_topics(pending)
-        if not topics:
-            return
-        if len(pending) < 2 and len(topics) < 2:
-            # 只有一条消息、且只聊一件事：不接管，走原生流程
+        max_topics = self._int_cfg("max_topics", 6, 2, 12)
+        messages = pending[-max_topics:]
+        if not messages:
             return
 
-        merged = "\n".join(t.text for t in pending)
+        # 只有一条消息、而且这句话本身只聊一件事 → 不接管，走原生流程
+        multi_in_one = (
+            len(messages) == 1
+            and len(split_topics(messages[0].text, max_topics, 2)) >= 2
+        )
+        if len(messages) < 2 and not multi_in_one:
+            return
+
+        merged = "\n".join(t.text for t in messages)
         try:
             event.message_str = merged  # type: ignore[misc]
             event.message_obj.message_str = merged
         except Exception:
             pass
 
-        # 多话题时要拿到完整文本再拆分发送，因此关掉流式
+        # 要拿到完整文本再分组、拆分发送，因此关掉流式
         try:
             event.set_extra("enable_streaming", False)
         except Exception:
             pass
 
+        # 这里存的是「原始消息」，由模型自己判断哪些消息属于同一个话题
         try:
-            event._mt_topics = topics  # type: ignore[attr-defined]
+            event._mt_topics = messages  # type: ignore[attr-defined]
         except Exception:
             return
 
         self._log(
-            f"待回复 {len(topics)} 个话题: {[t.text for t in topics]}"
+            f"防抖 {delay:g}s 结束，待回复 {len(messages)} 条消息: "
+            f"{[t.text for t in messages]}"
         )
 
     def _build_topics(self, messages: List[_Topic]) -> List[_Topic]:
@@ -586,45 +627,52 @@ class MultiTopicPlugin(Star):
             logger.warning(f"[multi_topic] 注入分答提示失败: {exc}")
 
     def _build_hint(self, topics: List[_Topic]) -> str:
-        lines = "\n".join(
-            f"第{i}条：{t.text[:300]}" for i, t in enumerate(topics, 1)
-        )
         n = len(topics)
+        lines = "\n".join(
+            f"消息{i}：{t.text[:300]}" for i, t in enumerate(topics, 1)
+        )
         if n == 1:
             example = (
                 "[[T1]]\n"
-                "（回复这句话的第一句）\n"
+                "（回应第一个话题的第一句）\n"
                 "[[S]]\n"
                 "（同一话题的下一句，可省略）\n"
             )
-            order_rule = "2. 一次只回这一件事，把话说完即可。\n"
+            group_rule = (
+                "2. 这一条消息里如果有多个互相独立的话题，就拆成多个 [[T1]] 块，"
+                "分别回应。\n"
+            )
         else:
             example = (
                 "[[T1]]\n"
-                "（回复第 1 条消息的第一句话）\n"
+                "（回应从消息 1 开始的那个话题）\n"
                 "[[S]]\n"
-                "（回复第 1 条消息的下一句话，可省略）\n"
+                "（同一话题的下一句，可省略）\n"
                 "[[T2]]\n"
-                "（回复第 2 条消息的第一句话）\n"
+                "（回应从消息 2 开始的那个话题）\n"
                 "……\n"
             )
-            order_rule = "2. 先把第 1 条完整回完，再回第 2 条，不要把几条揉在一段里。\n"
+            group_rule = (
+                "2. 几条消息如果是在说同一件事，就合并成一次回应；"
+                "[[Tn]] 的 n 用这个话题**第一条消息的序号**，不要从 1 连续重排。\n"
+            )
         return (
-            "【多话题回复】\n"
-            f"用户这一轮有 {n} 条消息需要回应，按顺序是：\n"
+            "【分话题回复】\n"
+            f"用户这一轮连续发了 {n} 条消息（可能有多个话题，也可能几条在说同一件事）：\n"
             f"{lines}\n\n"
-            "请像真人在 QQ 上聊天一样，一条一条地回。严格使用下面的格式"
-            "（分隔标记必须保留，不要解释它）：\n"
+            "请先自己判断这些消息分别属于哪些话题，再按话题逐个回应。"
+            "严格使用下面的格式（分隔标记必须保留，不要解释它）：\n"
             f"{example}\n"
             "要求：\n"
             "1. 不要输出“1.”“2.”、不要用列表、不要写“问题一/回答一”，"
             "不要解释你在做什么——就像随口聊天。\n"
-            f"{order_rule}"
-            "3. 每条消息只写一两句口语，一个话题 1~3 条即可，不要长篇大论。\n"
-            "4. 不要复述用户的原话，不要加“好的，我先回答第一个”这种过渡句。\n"
-            "5. 之前已经聊过、用户这次没有追问的话题，不要再翻出来；"
+            f"{group_rule}"
+            "3. 每个话题单独回应，按话题出现的顺序来；不要把几个话题揉在一段里。\n"
+            "4. 每条只写一两句口语，一个话题 1~3 条即可，不要长篇大论。\n"
+            "5. 不要复述用户的原话，不要加“好的，我先回答第一个”这种过渡句。\n"
+            "6. 之前已经聊过、用户这次没有追问的话题，不要再翻出来；"
             "如果某条消息是在接着上一个话题说，就顺着接下去，不要重复回答。\n"
-            "6. 分隔标记必须使用英文半角方括号和半角字母（[[T1]]、[[S]]），"
+            "7. 分隔标记必须使用英文半角方括号和半角字母（[[T1]]、[[S]]），"
             "不要改写成全角括号、中文标点或别的写法。"
         )
 
@@ -720,11 +768,9 @@ class MultiTopicPlugin(Star):
 
         text = "".join(comp.text for comp in result.chain)
         blocks = _parse_blocks(text)
-        need = 2 if len(topics) >= 2 else 1
-        if len(blocks) < need:
+        if not blocks:
             self._log(
-                f"回复未按格式分块（解析到 {len(blocks)} 块，期望 {need} 块），"
-                f"回退为普通回复；原文开头(ascii): {ascii(text[:200])}"
+                f"回复未按格式分块，回退为普通回复；原文开头(ascii): {ascii(text[:200])}"
             )
             cleaned = _strip_markers(text)
             if cleaned and cleaned != text:
@@ -740,7 +786,7 @@ class MultiTopicPlugin(Star):
         try:
             await self._send_blocks(event, blocks, topics)
             total = sum(len(block.segments) for block in blocks)
-            self._log(f"已按 {len(blocks)} 个话题分条发送 {total} 条消息")
+            self._log(f"已按 {len(blocks)} 组话题回复分条发送 {total} 条消息")
         except Exception as exc:
             logger.warning(f"[multi_topic] 分条发送失败，回退为普通回复: {exc}")
             cleaned = _strip_markers(text)
